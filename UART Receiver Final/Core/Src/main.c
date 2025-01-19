@@ -18,12 +18,15 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "usb_device.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "usb_device.h"
+#include "usbd_cdc_if.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -37,12 +40,16 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-#define MAX_PACKET_SIZE 255
+#define NUM_OF_PACKETS 255
+#define FULL_PACKET 4
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+TIM_HandleTypeDef htim3;
+
 UART_HandleTypeDef huart1;
 DMA_HandleTypeDef hdma_usart1_rx;
+DMA_HandleTypeDef hdma_usart1_tx;
 
 /* USER CODE BEGIN PV */
 
@@ -53,6 +60,7 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_USART1_UART_Init(void);
+static void MX_TIM3_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -60,28 +68,41 @@ static void MX_USART1_UART_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-
-struct connection {
+typedef struct {
     uint8_t packet_size; // Not inclusive of the 1 byte crc
     uint8_t num_of_packets; // Total number of packets to be sent
-    uint8_t total_size; // Size of data not including padding (actual size)
+    uint8_t total_size; // Size of data not including padding (actual size), will be modified as packets are received
     uint8_t crc;
-    uint8_t handshake; // true if identical
-};
 
-struct data {
+    uint8_t handshake; // true if tx and rx handshake are identical
+    uint8_t padding; // Number of padded bytes, equivalent to
+    				 // packet_size * num_of_packets - total_size
+} connection;
+
+typedef struct {
+    uint8_t corrupt_packets[NUM_OF_PACKETS];
+    uint8_t num_corrupt;
+    uint8_t curr_pckt;
+} internal_state;
+
+typedef struct {
 	double x_coord;
 	double y_coord;
 	double z_coord;
 
 	uint8_t control;
-};
+} data;
 
 
-uint8_t rx_buffer[26];
-uint8_t packet[MAX_PACKET_SIZE];
 
-struct connection* p_recv_init; // Pointer to recv_init struct, initialized in main
+uint8_t packets[NUM_OF_PACKETS][FULL_PACKET];
+uint8_t flag;
+uint8_t received;
+uint8_t padding;
+
+// Global pointer to structs initialized in main
+connection* p_recv_init;
+internal_state* p_intl_state;
 
 uint8_t calculate_crc(uint8_t* buffer, const size_t data_length) {
     /*
@@ -109,7 +130,7 @@ uint8_t calculate_crc(uint8_t* buffer, const size_t data_length) {
      * 		8-bit CRC checksum
 	*/
 
-	uint8_t crc = 0;
+	uint8_t crc = 0x0;
 	uint8_t *byte = buffer;
 
 	// Sum all bytes of data
@@ -124,19 +145,46 @@ uint8_t calculate_crc(uint8_t* buffer, const size_t data_length) {
     return crc;
 }
 
-void receive_gps_data(struct data *data, uint8_t* rx_buffer){
-    double temp [3] = {0};
-    for (int i =0; i <3; i++){
-    	memcpy(&temp[i], rx_buffer, sizeof(double));  // Copy 8 bytes to temp[i]
-    	rx_buffer += sizeof(double);  // Move the pointer by 8 bytes (size of double)
+int receive_gps_data(uint8_t* packets, connection* p_recv_init, data* dest){
+	/* Extracts GPS and control data from array of packets to save into a destination data
+	 * struct.
+	 *
+	 *
+	 * INPUTS
+	 * 		packets : uint8_t*
+	 * 		Pointer to array of packets
+	 *
+	 * 		p_recv_init : const connection*
+	 * 		Pointer to connection struct. Useful for determining number of packets,
+	 * 		packet size, and number of valid data bytes not including padding.
+	 *
+	 * 		dest : data*
+	 * 		Pointer to data struct
+	 *
+	 * OUTPUTS
+	 *		int
+	 *		0 means success, 1 means error
+	 * */
+
+	// Ensure that size of destination data struct matches size of received data
+	if (sizeof(*dest) != (p_recv_init->packet_size * p_recv_init->num_of_packets) - p_recv_init->padding) {
+		return 1;
+	}
+
+    uint8_t* curr = dest;
+
+    // For all packets excluding last (due to padding on last packet), save to data struct
+    for (int i = 0; i < p_recv_init->num_of_packets - 2; i++) {
+    	memcpy(curr, &packets[(i * FULL_PACKET) - 1], p_recv_init->packet_size);
+    	curr += p_recv_init->packet_size;
     }
-	  data->x_coord = temp[0];
-	  data->y_coord = temp[1];
-	  data->z_coord = temp[2];
+
+    // Save last packet considering any padding
+    memcpy(curr, &packets[((p_recv_init->num_of_packets - 1) * FULL_PACKET) - 1], p_recv_init->packet_size - p_recv_init->padding);
+    curr += p_recv_init->packet_size - p_recv_init->padding; // At this point, curr should be at the end of the data struct
+
+    return 0;
 }
-
-
-
 
 /* USER CODE END 0 */
 
@@ -147,7 +195,6 @@ void receive_gps_data(struct data *data, uint8_t* rx_buffer){
 int main(void)
 {
   /* USER CODE BEGIN 1 */
-
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -170,11 +217,21 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_USART1_UART_Init();
+  MX_USB_DEVICE_Init();
+  MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
-  struct connection recv_init;
-  struct data test;
+
+  received = 0;
+
+  connection recv_init;
+  internal_state intl_state;
+  intl_state.curr_pckt = 0;
+  intl_state.num_corrupt = 0;
+
+  data test;
 
   p_recv_init = &recv_init;
+  p_intl_state = &intl_state;
 
 //  test.x_coord = 2.22;
 //  test.y_coord = 1.23;
@@ -190,6 +247,10 @@ int main(void)
 //
 //  uint8_t crc = calculate_crc(rx_buffer, sizeof(rx_buffer)-1);
   p_recv_init->handshake = 0;
+  memset(packets, 0, sizeof(packets));
+
+  // Should I start a timeout timer here as well?
+//  HAL_TIM_Base_Start_IT(&htim3);
   HAL_UART_Receive_DMA(&huart1, (uint8_t *)p_recv_init, 4);
   /* USER CODE END 2 */
 
@@ -197,9 +258,34 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+	  if (received == 1) {
+		  // Extract GPS data from packets
+		  int ret;
+		  ret = receive_gps_data(packets, p_recv_init, &test);
+		  char msg[128];
+		  // Transmit message to computer via USB
+		  if (ret == 0){ // Transmit data
+			  // Can't transmit float due to FLASH size limitations (might work on different board)
+//			  sprintf(msg, "COORDS: (%f,%f,%f)\r\nCTRL: %d\r\n\n", test.x_coord, test.y_coord, test.z_coord, test.control);
 
+			  // For now we send raw bytes and computer can decode them as needed.
+			  CDC_Transmit_FS((uint8_t*)&test, sizeof(test));
+		  } else if (ret == 1){ // Transmit error message and exit program
+			  sprintf(msg, "TERMINATED: Size of data struct does not match size of received data.\n");
+			  CDC_Transmit_FS((uint8_t*)msg, strlen(msg));
+			  return 1;
+		  }
 
-	  //HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 1000);
+		  // Cleanup
+		  received = 0;
+		  memset(packets, 0, sizeof(packets));
+		  memset(p_recv_init, 0, sizeof(*p_recv_init));
+		  memset(p_intl_state, 0, sizeof(*p_intl_state));
+		  // Should I start a timeout timer here as well?
+		//  HAL_TIM_Base_Start_IT(&htim3);
+		  HAL_UART_Receive_DMA(&huart1, (uint8_t *)p_recv_init, 4);
+	  }
+
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -220,9 +306,8 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
-  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI48;
+  RCC_OscInitStruct.HSI48State = RCC_HSI48_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
@@ -233,20 +318,67 @@ void SystemClock_Config(void)
   */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI48;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK)
   {
     Error_Handler();
   }
-  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USART1;
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USB|RCC_PERIPHCLK_USART1;
   PeriphClkInit.Usart1ClockSelection = RCC_USART1CLKSOURCE_PCLK1;
+  PeriphClkInit.UsbClockSelection = RCC_USBCLKSOURCE_HSI48;
+
   if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void)
+{
+
+  /* USER CODE BEGIN TIM3_Init 0 */
+
+  /* USER CODE END TIM3_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM3_Init 1 */
+
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 48000 - 1;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 3000 - 1;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM3_Init 2 */
+
+  /* USER CODE END TIM3_Init 2 */
+
 }
 
 /**
@@ -273,9 +405,7 @@ static void MX_USART1_UART_Init(void)
   huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
   huart1.Init.OverSampling = UART_OVERSAMPLING_16;
   huart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
-  huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_AUTOBAUDRATE_INIT;
-  huart1.AdvancedInit.AutoBaudRateEnable = UART_ADVFEATURE_AUTOBAUDRATE_ENABLE;
-  huart1.AdvancedInit.AutoBaudRateMode = UART_ADVFEATURE_AUTOBAUDRATE_ONSTARTBIT;
+  huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
   if (HAL_UART_Init(&huart1) != HAL_OK)
   {
     Error_Handler();
@@ -327,66 +457,131 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
+
+	// Step 2: Either wait for new handshake or receive packet
 	if (p_recv_init->handshake == 0) { // If handshake failed, await new handshake
 		HAL_UART_Receive_DMA(&huart1, (uint8_t *)p_recv_init, 4);
 	} else if (p_recv_init->handshake == 1) { // If the handshake succeeded, receive
-		HAL_UART_Receive_DMA(&huart1, &packet, p_recv_init->packet_size);
+		HAL_UART_Receive_DMA(&huart1, &packets[p_intl_state->curr_pckt], p_recv_init->packet_size + 1);
+		p_intl_state->curr_pckt++;
+	} else if (p_recv_init->handshake == 2) { // If we are expecting resent packets, receive
+		p_intl_state->num_corrupt--;
+		// Find target index in packets array
+		uint8_t* dest = packets[p_intl_state->corrupt_packets[p_intl_state->num_corrupt]];
+		HAL_UART_Receive_DMA(&huart1, dest, p_recv_init->packet_size + 1);
 	}
 
+	// Start timeout timer
+	HAL_TIM_Base_Start_IT(&htim3);
 }
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
 
-  if (p_recv_init->handshake == 0) { // Step 1: Handshake
+	// Stop and reset timeout timer
+	HAL_TIM_Base_Stop_IT(&htim3);
+	__HAL_TIM_SET_COUNTER(&htim3, 0);
+
+	if (p_recv_init->handshake == 0) { // Step 1: Handshake
 
 	  /*
-	   * Flag Value: Meaning -> Result
+	   * Flag Value : Meaning -> Result
 	   *
-	   * 0: Matched CRC (Valid Data) -> Continue Transaction
-	   * 1: Mismatched CRC (Corrupted Data) -> Send retry request to transmitter
+	   * 0 : Matched CRC (Valid Data) -> Continue Transaction
+	   * 1 : Mismatched CRC (Corrupted Data) -> Send retry request to transmitter
 	   *
 	   * */
 
-	  uint8_t flag = 0;
-	  uint8_t recv_crc = calculate_crc((uint8_t*)p_recv_init, 4);
+	  uint8_t recv_crc = calculate_crc((uint8_t*)p_recv_init, 3);
 
 	  if (recv_crc != p_recv_init->crc) {
 		  flag = 1;
-		  HAL_UART_Transmit_DMA(&huart1, &flag, 1);
 	  } else {
 		  p_recv_init->handshake = 1;
-		  HAL_UART_Transmit_DMA(&huart1, &flag, 1);
+		  flag = 0;
+
+		  // Calculate and save number of padded bytes
+		  p_recv_init->padding = (p_recv_init->packet_size * p_recv_init->num_of_packets) - p_recv_init->total_size;
 	  }
 
-  } else if (recv_init.handshake == 1) { // Step 2: Receive Data
-
-  }
+	  HAL_UART_Transmit_DMA(&huart1, &flag, 1);
 
 
-  //HAL_UART_Receive_DMA(&huart1, rx_buffer + 1, sizeof(rx_buffer) - 1);
-  uint8_t transmit_crc = rx_buffer[sizeof(rx_buffer)-1];
+	} else if (p_recv_init->handshake == 1) { // Step 3: Verify Received Data
 
-  if(calculate_crc(rx_buffer,sizeof(rx_buffer)-1) == transmit_crc ){
-	  struct data out;
-      uint8_t * receive_data = &rx_buffer;
-      uint8_t data_avail = rx_buffer[0];
-      receive_data++;
-      if (data_avail == 1){
-      } else if (data_avail == 2){
-      } else if(data_avail == 3){
-    	// Save buffer data to struct
-        receive_gps_data(&out, receive_data);
-        out.control = *receive_data;
-      }
+	  // Check CRC
+	  uint8_t recv_crc = calculate_crc(&packets[p_intl_state->curr_pckt - 1], p_recv_init->packet_size);
+	  if (recv_crc != packets[p_intl_state->curr_pckt - 1][p_recv_init->packet_size]) {
+		 p_intl_state->corrupt_packets[p_intl_state->num_corrupt] = p_intl_state->curr_pckt;
+		 p_intl_state->num_corrupt++;
+	  }
 
-   }
+	  // Check total size
+	  if (p_recv_init->total_size < p_recv_init->packet_size) {
+		  p_recv_init->total_size = 0;
+	  } else {
+		  p_recv_init->total_size -= p_recv_init->packet_size;
+	  }
 
-  memset(rx_buffer, 0, sizeof(rx_buffer)); //!!! Clear buffer (or what should we do if CRCs don't match?)
-  HAL_UART_Receive_DMA(&huart1, rx_buffer, sizeof(rx_buffer));
+	  // Receive only if we are expecting more packets
+	  if (p_intl_state->curr_pckt != p_recv_init->num_of_packets) {
+		  HAL_UART_Receive_DMA(&huart1, &packets[p_intl_state->curr_pckt], p_recv_init->packet_size + 1);
+		  p_intl_state->curr_pckt++;
+
+		  // Start timeout timer
+		  HAL_TIM_Base_Start_IT(&htim3);
+	  } else {
+		  if (p_intl_state->num_corrupt > 0) {
+			  p_recv_init->handshake = 2; // Step 4: Ask transmitter to re-send lost packets
+			  HAL_UART_Transmit_DMA(&huart1, &p_intl_state->corrupt_packets[p_intl_state->num_corrupt - 1] , 1);
+		  }
+
+	  }
+	} else if (p_recv_init->handshake == 2) {
+	  if (p_intl_state->num_corrupt > 0) {
+		  HAL_UART_Transmit_DMA(&huart1, &p_intl_state->corrupt_packets[p_intl_state->num_corrupt - 1] , 1);
+	  } else { // Step 5: Done receiving packets, set received flag to do processing in main while loop
+		  received = 1;
+	  }
+
+	}
+
+//  //HAL_UART_Receive_DMA(&huart1, rx_buffer + 1, sizeof(rx_buffer) - 1);
+//  uint8_t transmit_crc = rx_buffer[sizeof(rx_buffer)-1];
+//
+//  if(calculate_crc(rx_buffer,sizeof(rx_buffer)-1) == transmit_crc ){
+//	  struct data out;
+//      uint8_t * receive_data = &rx_buffer;
+//      uint8_t data_avail = rx_buffer[0];
+//      receive_data++;
+//      if (data_avail == 1){
+//      } else if (data_avail == 2){
+//      } else if(data_avail == 3){
+//    	// Save buffer data to struct
+//        receive_gps_data(&out, receive_data);
+//        out.control = *receive_data;
+//      }
+//
+//   }
+//
+//  memset(rx_buffer, 0, sizeof(rx_buffer)); //!!! Clear buffer (or what should we do if CRCs don't match?)
+//  HAL_UART_Receive_DMA(&huart1, rx_buffer, sizeof(rx_buffer));
 
   return;
 }
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
+    if (htim->Instance == TIM3) {  // Timer TIM3 timeout
+    	HAL_UART_DMAStop(&huart1);  // Stops any UART DMA (both TX and RX)
+    	memset(packets, 0, sizeof(packets));
+		memset(p_recv_init, 0, sizeof(*p_recv_init));
+		memset(p_intl_state, 0, sizeof(*p_intl_state));
+		// Should I start a timeout timer here as well?
+	  //  HAL_TIM_Base_Start_IT(&htim3);
+		HAL_UART_Receive_DMA(&huart1, (uint8_t *)p_recv_init, 4);
+    }
+}
+
 /* USER CODE END 4 */
 
 /**
