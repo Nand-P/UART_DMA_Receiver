@@ -9,7 +9,10 @@ RM := rm -rf
 
 # All of the sources participating in the build are defined here
 -include sources.mk
--include Drivers/STM32F0xx_HAL_Driver/Src/subdir.mk
+-include USB_DEVICE/Target/subdir.mk
+-include USB_DEVICE/App/subdir.mk
+-include Middlewares/USB_Device_Library/subdir.mk
+-include Drivers/STM32F0xx_HAL_Driver/subdir.mk
 -include Core/Startup/subdir.mk
 -include Core/Src/subdir.mk
 -include objects.mk
@@ -75,8 +78,8 @@ all: main-build
 main-build: UART\ Receiver\ Final.elf secondary-outputs
 
 # Tool invocations
-UART\ Receiver\ Final.elf UART\ Receiver\ Final.map: $(OBJS) $(USER_OBJS) C:\Users\Nand\STM32CubeIDE\workspace_1.10.1\UART\ Receiver\ Final\STM32F042K6TX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-g++ -o "UART Receiver Final.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m0 -T"C:\Users\Nand\STM32CubeIDE\workspace_1.10.1\UART Receiver Final\STM32F042K6TX_FLASH.ld" --specs=nosys.specs -Wl,-Map="UART Receiver Final.map" -Wl,--gc-sections -static --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -lstdc++ -lsupc++ -Wl,--end-group
+UART\ Receiver\ Final.elf UART\ Receiver\ Final.map: $(OBJS) $(USER_OBJS) C:\Users\Nand\Downloads\UART_DMA_Receiver\UART\ Receiver\ Final\STM32F042K6TX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-g++ -o "UART Receiver Final.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m0 -T"C:\Users\Nand\Downloads\UART_DMA_Receiver\UART Receiver Final\STM32F042K6TX_FLASH.ld" --specs=nosys.specs -Wl,-Map="UART Receiver Final.map" -Wl,--gc-sections -static --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -lstdc++ -lsupc++ -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 

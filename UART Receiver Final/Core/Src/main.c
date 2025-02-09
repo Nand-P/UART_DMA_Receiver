@@ -27,6 +27,8 @@
 #include <stdlib.h>
 #include "usb_device.h"
 #include "usbd_cdc_if.h"
+#include "uart_common.h"
+#include "uart_receive.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -40,8 +42,8 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-#define NUM_OF_PACKETS 255
-#define FULL_PACKET 4
+//#define MAX_PACKET_SIZE 255
+//#define FULL_PACKET 4
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
@@ -69,33 +71,12 @@ static void MX_TIM3_Init(void);
 /* USER CODE BEGIN 0 */
 
 typedef struct {
-    uint8_t packet_size; // Not inclusive of the 1 byte crc
-    uint8_t num_of_packets; // Total number of packets to be sent
-    uint8_t total_size; // Size of data not including padding (actual size), will be modified as packets are received
-    uint8_t crc;
-
-    uint8_t handshake; // true if tx and rx handshake are identical
-    uint8_t padding; // Number of padded bytes, equivalent to
-    				 // packet_size * num_of_packets - total_size
-} connection;
-
-typedef struct {
-    uint8_t corrupt_packets[NUM_OF_PACKETS];
+    uint8_t corrupt_packets[MAX_PACKET_SIZE];
     uint8_t num_corrupt;
     uint8_t curr_pckt;
 } internal_state;
 
-typedef struct {
-	double x_coord;
-	double y_coord;
-	double z_coord;
-
-	uint8_t control;
-} data;
-
-
-
-uint8_t packets[NUM_OF_PACKETS][FULL_PACKET];
+uint8_t packets[MAX_PACKET_SIZE][PACKET_SIZE + 1];
 uint8_t flag;
 uint8_t received;
 uint8_t padding;
@@ -103,88 +84,6 @@ uint8_t padding;
 // Global pointer to structs initialized in main
 connection* p_recv_init;
 internal_state* p_intl_state;
-
-uint8_t calculate_crc(uint8_t* buffer, const size_t data_length) {
-    /*
-     * This function calculates an 8-bit CRC checksum given a buffer
-     * of uint8_t data using the HAL_CRC_Calculate API.
-     *
-     * MX_CRC_Init() must be created from the .ioc setup and configured
-     * to output an 8-bit CRC.
-     *
-     * If the buffer is terminated with an 8-bit checksum, it must be
-     * excluded from this function by passing sizeof(buffer) - 1 for the
-     * data_length parameter. This will prevent it from being included
-     * as part of the checksum calculation.
-     *
-     * INPUTS
-     * 		buffer : const uint8_t *
-     * 		Buffer to calculate CRC from
-     *
-     * 		data_length : const size_t
-     * 		Size of data in bytes. Equivalent to the number of elements
-     * 		corresponding to data in the buffer.
-     *
-     * OUTPUTS
-     * 		crc : uint8_t
-     * 		8-bit CRC checksum
-	*/
-
-	uint8_t crc = 0x0;
-	uint8_t *byte = buffer;
-
-	// Sum all bytes of data
-	for (int i=0; i < data_length; i++) {
-		crc += *byte;
-		byte++;
-	}
-
-	// Take 2s complement of the sum
-	crc = (~crc) + 1;
-
-    return crc;
-}
-
-int receive_gps_data(uint8_t* packets, connection* p_recv_init, data* dest){
-	/* Extracts GPS and control data from array of packets to save into a destination data
-	 * struct.
-	 *
-	 *
-	 * INPUTS
-	 * 		packets : uint8_t*
-	 * 		Pointer to array of packets
-	 *
-	 * 		p_recv_init : const connection*
-	 * 		Pointer to connection struct. Useful for determining number of packets,
-	 * 		packet size, and number of valid data bytes not including padding.
-	 *
-	 * 		dest : data*
-	 * 		Pointer to data struct
-	 *
-	 * OUTPUTS
-	 *		int
-	 *		0 means success, 1 means error
-	 * */
-
-	// Ensure that size of destination data struct matches size of received data
-	if (sizeof(*dest) != (p_recv_init->packet_size * p_recv_init->num_of_packets) - p_recv_init->padding) {
-		return 1;
-	}
-
-    uint8_t* curr = dest;
-
-    // For all packets excluding last (due to padding on last packet), save to data struct
-    for (int i = 0; i < p_recv_init->num_of_packets - 2; i++) {
-    	memcpy(curr, &packets[(i * FULL_PACKET) - 1], p_recv_init->packet_size);
-    	curr += p_recv_init->packet_size;
-    }
-
-    // Save last packet considering any padding
-    memcpy(curr, &packets[((p_recv_init->num_of_packets - 1) * FULL_PACKET) - 1], p_recv_init->packet_size - p_recv_init->padding);
-    curr += p_recv_init->packet_size - p_recv_init->padding; // At this point, curr should be at the end of the data struct
-
-    return 0;
-}
 
 /* USER CODE END 0 */
 
@@ -246,6 +145,7 @@ int main(void)
 //  }
 //
 //  uint8_t crc = calculate_crc(rx_buffer, sizeof(rx_buffer)-1);
+
   p_recv_init->handshake = 0;
   memset(packets, 0, sizeof(packets));
 
@@ -270,7 +170,7 @@ int main(void)
 
 			  // For now we send raw bytes and computer can decode them as needed.
 			  CDC_Transmit_FS((uint8_t*)&test, sizeof(test));
-		  } else if (ret == 1){ // Transmit error message and exit program
+		  } else if (ret == 1){ // Transmit error message and exit program (maybe just reset instead?)
 			  sprintf(msg, "TERMINATED: Size of data struct does not match size of received data.\n");
 			  CDC_Transmit_FS((uint8_t*)msg, strlen(msg));
 			  return 1;
